@@ -38,17 +38,30 @@ def _normalize_columns(raw_cols: Iterable[str]) -> Dict[str, str]:
     return mapping
 
 
-def _load_array(data: np.lib.npyio.NpzFile, key: str) -> np.ndarray:
-    values = np.array(data[key]).ravel()
-    # Flatten nested/array cells to their first element when needed
-    flattened = []
-    for val in values:
+def _flatten_interactions(arr: np.ndarray) -> Tuple[np.ndarray, Tuple[int, ...]]:
+    """Flatten per-user interaction sequences while tracking their lengths."""
+
+    # Fast path: already a flat numeric array (one interaction per row)
+    if arr.dtype != object:
+        flat = np.asarray(arr).ravel()
+        return flat, tuple(1 for _ in range(len(flat)))
+
+    lengths = []
+    sequences = []
+    for idx, val in enumerate(arr):
         if isinstance(val, (list, tuple, np.ndarray)):
-            arr = np.array(val).ravel()
-            flattened.append(arr[0] if arr.size else np.nan)
+            seq = np.asarray(val).ravel()
         else:
-            flattened.append(val)
-    return np.asarray(flattened)
+            seq = np.asarray([val])
+
+        lengths.append(len(seq))
+        sequences.append(seq)
+
+        if len(seq) == 0:
+            raise ValueError(f"Empty interaction sequence encountered at index {idx}")
+
+    flat = np.concatenate(sequences) if sequences else np.array([], dtype=float)
+    return flat, tuple(lengths)
 
 
 def summarize_npz(path: str) -> Tuple[int, int, int]:
@@ -62,18 +75,25 @@ def summarize_npz(path: str) -> Tuple[int, int, int]:
         )
 
     mapping = _normalize_columns(data.files)
-    user_arr = _load_array(data, mapping["user_id"])
-    problem_arr = _load_array(data, mapping["problem_id"])
-    skill_arr = _load_array(data, mapping["skill_id"])
+    user_arr = np.array(data[mapping["user_id"]]).ravel()
+    problem_flat, problem_lengths = _flatten_interactions(np.array(data[mapping["problem_id"]]))
+    skill_flat, skill_lengths = _flatten_interactions(np.array(data[mapping["skill_id"]]))
 
-    # Use the minimum aligned length across required columns to avoid length mismatches
-    aligned_len = min(len(user_arr), len(problem_arr), len(skill_arr))
-    user_arr = user_arr[:aligned_len]
-    problem_arr = problem_arr[:aligned_len]
+    if len(problem_lengths) != len(user_arr):
+        raise ValueError(
+            "User array length does not match per-user interaction sequences: "
+            f"users={len(user_arr)}, problem sequences={len(problem_lengths)}"
+        )
+    if problem_lengths != skill_lengths:
+        mismatch_idx = next(idx for idx, pair in enumerate(zip(problem_lengths, skill_lengths)) if pair[0] != pair[1])
+        raise ValueError(
+            "Mismatched interaction lengths between problem_id and skill_id columns at index "
+            f"{mismatch_idx}: problem_len={problem_lengths[mismatch_idx]}, skill_len={skill_lengths[mismatch_idx]}"
+        )
 
     num_users = len(np.unique(user_arr))
-    num_problems = len(np.unique(problem_arr))
-    num_interactions = aligned_len
+    num_problems = len(np.unique(problem_flat))
+    num_interactions = int(sum(problem_lengths))
     return num_users, num_problems, num_interactions
 
 
