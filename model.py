@@ -1,190 +1,123 @@
 # -*- coding:utf-8 -*-
-__author__ = 'shshen'
+"""PyTorch implementation of the DIM model.
 
-import numpy as np
-import tensorflow as tf
+The original TensorFlow v1 graph used custom gating operations. This module
+re-creates the same computations using PyTorch so that checkpoints can be saved
+in ``.pt`` format.
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def weight_variable(shape,  name=None, training = None):
-    initial = tf.Variable(tf.compat.v1.keras.initializers.glorot_uniform()(shape) , trainable=True, name=name)  
-    return initial
-def bias_variable(shape,  name=None, training = None):
-    initial = tf.Variable(tf.compat.v1.keras.initializers.glorot_uniform()(shape) , trainable=True, name=name) 
-    return initial
 
-class DIM(object):
+class DIM(nn.Module):
+    """Difficulty-Influenced Memory model in PyTorch."""
 
-    def __init__(self, batch_size, num_steps, num_skills, hidden_size):
-        
-        self.batch_size = batch_size = batch_size
-        self.hidden_size  = hidden_size
+    def __init__(self, num_steps: int, num_skills: int, hidden_size: int, dropout: float = 0.8):
+        super().__init__()
         self.num_steps = num_steps
-        self.num_skills =  num_skills
+        self.num_skills = num_skills
+        self.hidden_size = hidden_size
+        self.dropout = dropout
 
-        self.input_p = tf.compat.v1.placeholder(tf.int32, [batch_size, num_steps], name="input_p")
-        self.target_p = tf.compat.v1.placeholder(tf.int32, [batch_size, num_steps], name="target_p")
-        self.input_sd = tf.compat.v1.placeholder(tf.int32, [batch_size, num_steps], name="input_sd")
-        self.input_d = tf.compat.v1.placeholder(tf.int32, [batch_size, num_steps], name="input_d")
-        self.input_kc = tf.compat.v1.placeholder(tf.float32, [batch_size, num_steps, num_skills], name="input_kc")
-        self.x_answer = tf.compat.v1.placeholder(tf.int32, [batch_size,num_steps], name="x_answer")
-        self.target_sd = tf.compat.v1.placeholder(tf.int32, [batch_size,num_steps], name="target_sd")
-        self.target_d = tf.compat.v1.placeholder(tf.int32, [batch_size,num_steps], name="target_d")
-        self.target_kc = tf.compat.v1.placeholder(tf.float32, [batch_size, num_steps, num_skills], name="target_kc")
-        self.target_index = tf.compat.v1.placeholder(tf.int32, [None], name="target_index")
-        self.target_correctness = tf.compat.v1.placeholder(tf.float32, [None], name="target_correctness")
+        # Embeddings (padding index 0 keeps parity with the original TF code)
+        self.problem_embed = nn.Embedding(53092, hidden_size, padding_idx=0)
+        self.sd_embed = nn.Embedding(1011, hidden_size, padding_idx=0)
+        self.difficulty_embed = nn.Embedding(1011, hidden_size, padding_idx=0)
+        self.answer_embed = nn.Embedding(2, hidden_size)
 
+        # Project KC one-hot vectors to hidden dimension
+        self.skill_proj = nn.Linear(num_skills, hidden_size)
+        self.target_skill_proj = nn.Linear(num_skills, hidden_size)
 
-        
-        self.dropout_keep_prob = tf.compat.v1.placeholder(tf.float32, name="dropout_keep_prob")
-        self.is_training = tf.compat.v1.placeholder(tf.bool, name="is_training")
-        
-        self.global_step = tf.Variable(0, trainable=False, name="Global_Step")
-        self.initializer=tf.compat.v1.keras.initializers.glorot_uniform()
-        
-        
-        # problem
-        self.p_w = tf.Variable(tf.compat.v1.keras.initializers.glorot_uniform()([53091, hidden_size]),dtype=tf.float32, trainable=True, name = 'p_w')
-        zero_p = tf.zeros((1, hidden_size))
-        all_p = tf.concat([zero_p, self.p_w ], axis = 0)
-        p_embedding =  tf.nn.embedding_lookup(all_p, self.input_p)
-        target_p =  tf.nn.embedding_lookup(all_p, self.target_p)
+        # Shared linear layers for gating operations
+        self.linear_l = nn.Linear(hidden_size, hidden_size)
+        self.linear_c = nn.Linear(hidden_size, hidden_size)
+        self.linear_o = nn.Linear(hidden_size * 2, hidden_size * 2)
+        self.linear_q = nn.Linear(hidden_size * 2, hidden_size * 2)
+        self.linear_1 = nn.Linear(hidden_size * 4, hidden_size * 4)
 
+        # Output projection for target features
+        self.input_proj = nn.Linear(hidden_size * 4, hidden_size)
+        self.target_proj = nn.Linear(hidden_size * 4, hidden_size)
 
-        self.sd_w = tf.Variable(tf.compat.v1.keras.initializers.glorot_uniform()([1010, hidden_size]),dtype=tf.float32, trainable=True, name = 'sd_w')
-        zero_sd = tf.zeros((1, hidden_size))
-        all_sd = tf.concat([zero_sd, self.sd_w ], axis = 0)
-        sd_embedding =  tf.nn.embedding_lookup(all_sd, self.input_sd)
-        target_sd =  tf.nn.embedding_lookup(all_sd, self.target_sd)
+        # Knowledge matrix replicated per batch in the original graph
+        self.knowledge_w = nn.Parameter(torch.empty(1, hidden_size))
+        nn.init.xavier_uniform_(self.knowledge_w)
 
+    def forward(self, batch):
+        # Unpack batch
+        input_p = batch["input_p"]
+        target_p = batch["target_p"]
+        input_sd = batch["input_sd"]
+        input_d = batch["input_d"]
+        input_kc = batch["input_kc"]
+        x_answer = batch["x_answer"]
+        target_sd = batch["target_sd"]
+        target_d = batch["target_d"]
+        target_kc = batch["target_kc"]
+        target_index = batch["target_index"]
 
-        skill_embedding =  tf.compat.v1.layers.dense(self.input_kc, units = hidden_size)
-        target_skill = tf.compat.v1.layers.dense(self.target_kc, units = hidden_size)
+        batch_size = input_p.size(0)
 
-        self.difficulty_w = tf.Variable(tf.compat.v1.keras.initializers.glorot_uniform()([1010, hidden_size]),dtype=tf.float32, trainable=True, name = 'difficulty_w')
-        zero_difficulty = tf.zeros((1, hidden_size))
-        all_difficulty = tf.concat([zero_difficulty, self.difficulty_w ], axis = 0)
-        difficulty_embedding =  tf.nn.embedding_lookup(all_difficulty, self.input_d)
-        target_difficulty =  tf.nn.embedding_lookup(all_difficulty, self.target_d)
+        # Embeddings
+        p_embedding = self.problem_embed(input_p)
+        target_p_emb = self.problem_embed(target_p)
+        sd_embedding = self.sd_embed(input_sd)
+        target_sd_emb = self.sd_embed(target_sd)
+        diff_embedding = self.difficulty_embed(input_d)
+        target_diff_emb = self.difficulty_embed(target_d)
+        ans_embedding = self.answer_embed(x_answer)
 
-        self.answer_w = tf.Variable(tf.compat.v1.keras.initializers.glorot_uniform()([2, hidden_size]),dtype=tf.float32, trainable=True, name = 'answer_w')
-        x_answer =  tf.nn.embedding_lookup(self.answer_w, self.x_answer)
+        skill_embedding = self.skill_proj(input_kc)
+        target_skill_emb = self.target_skill_proj(target_kc)
 
+        # Build input/target features
+        input_data = torch.cat(
+            [p_embedding, skill_embedding, sd_embedding, diff_embedding], dim=-1
+        )
+        input_data = self.input_proj(input_data)
 
+        target_data = torch.cat(
+            [target_p_emb, target_skill_emb, target_sd_emb, target_diff_emb], dim=-1
+        )
+        target_data = self.target_proj(target_data)
 
+        # Knowledge initialization
+        kkk = self.knowledge_w.expand(batch_size, -1)
 
-        input_data = tf.concat([p_embedding, skill_embedding, sd_embedding, difficulty_embedding], axis = -1)
-        input_data =  tf.compat.v1.layers.dense(input_data, units = hidden_size)
+        outputs = []
+        for i in range(self.num_steps):
+            sd_i = sd_embedding[:, i, :]
+            aa_i = ans_embedding[:, i, :]
+            dd_i = diff_embedding[:, i, :]
+            q1_i = input_data[:, i, :]
 
-        input_embedding = tf.add(input_data,0, name = 'input_embedding')
+            q = kkk - q1_i
+            input_gates = torch.sigmoid(self.linear_l(q))
+            c_title = torch.tanh(self.linear_c(q))
+            ccc = input_gates * F.dropout(c_title, p=self.dropout, training=self.training)
 
+            x = torch.cat([ccc, aa_i], dim=-1)
+            xx = torch.sigmoid(self.linear_o(x))
+            xx_title = torch.tanh(self.linear_q(x))
+            xx = xx * xx_title
 
-        target_data = tf.concat([target_p, target_skill, target_sd, target_difficulty], axis = -1)
-        target_data = tf.compat.v1.layers.dense(target_data, units = hidden_size) 
+            ins = torch.cat([kkk, aa_i, sd_i, dd_i], dim=-1)
+            ooo = torch.sigmoid(self.linear_1(ins))
+            kkk = ooo[:, : self.hidden_size] * kkk + (1 - ooo[:, : self.hidden_size]) * xx[:, : self.hidden_size]
 
+            outputs.append(kkk.unsqueeze(1))
 
+        output = torch.cat(outputs, dim=1)
+        logits = torch.sum(target_data * output, dim=-1).reshape(-1)
+        selected_logits = logits[target_index]
+        pred = torch.sigmoid(selected_logits)
+        return pred, selected_logits
 
-        self.knowledge_w = tf.Variable(tf.compat.v1.keras.initializers.glorot_uniform()([1, hidden_size]),dtype=tf.float32, trainable=True, name = 'knowledge_matrix')
-
-
-        kkk = tf.tile(self.knowledge_w, [batch_size,  1])
-
-
-
-        shape = sd_embedding.get_shape().as_list()
-        padd = tf.zeros((shape[0], 1, shape[2]))
-        sd_embedding = tf.concat([padd, sd_embedding], axis = 1)
-        slice_sd_embedding = tf.split(sd_embedding, self.num_steps+1, 1)
-
-       
-        
-        shape = x_answer.get_shape().as_list()
-        padd = tf.zeros((shape[0], 1, shape[2]))
-        x_answer = tf.concat([padd, x_answer], axis = 1)
-        slice_x_answer = tf.split(x_answer, self.num_steps+1, 1)
-
-        shape = input_data.get_shape().as_list()
-        padd = tf.zeros((shape[0], 1, shape[2]))
-        input_data = tf.concat([padd, input_data], axis = 1)
-        slice_input_data = tf.split(input_data, self.num_steps + 1, 1)
-
-
-        input_diff = tf.concat([padd, difficulty_embedding], axis = 1)
-        slice_input_diff = tf.split(input_diff, self.num_steps + 1, 1)
-
-
-
-        h = list()
-
-
-
-        w_l = weight_variable([shape[2], 1*hidden_size], name = 'w_l', training = self.is_training )
-        b_l = bias_variable([shape[2]],  name='b_l', training = self.is_training )
-
-        w_c = weight_variable([shape[2], 1*hidden_size], name = 'w_c', training = self.is_training )
-        b_c = bias_variable([shape[2]],  name='b_c', training = self.is_training )
-
-
-        w_o = weight_variable([shape[2], 2*hidden_size], name = 'w_o', training = self.is_training )
-        b_o = bias_variable([shape[2]],  name='b_o', training = self.is_training )
-
-        
-
-        w_q = weight_variable([shape[2], 2*hidden_size], name = 'w_q', training = self.is_training )
-        b_q = bias_variable([shape[2]],  name='b_q', training = self.is_training )
-
-        w_b = weight_variable([shape[2], 4*hidden_size], name = 'w_b', training = self.is_training )
-        b_b = bias_variable([shape[2]],  name='b_b', training = self.is_training )
-        w_1 = weight_variable([shape[2], 4*hidden_size], name = 'w_1', training = self.is_training )
-        b_1 = bias_variable([shape[2]],  name='b_1', training = self.is_training )
-
-
-        
-
-        for i in range(1,self.num_steps+1):
-
-            sd = tf.squeeze(slice_sd_embedding[i], 1)
-
-            aa = tf.squeeze(slice_x_answer[i], 1)
-
-            dd = tf.squeeze(slice_input_diff[i], 1)
-
-            q1 = tf.squeeze(slice_input_data[i], 1)  
-
-
-            q = kkk - q1 
-
-            input_gates = tf.sigmoid(tf.matmul(q,  tf.transpose(w_l, [1,0])+b_l), name='l_gate')
-            c_title = tf.tanh(tf.matmul(q,  tf.transpose(w_c, [1,0])+b_c), name='c_gate')
-            c_title = tf.nn.dropout(c_title, self.dropout_keep_prob)
-
-            ccc = input_gates*c_title
-
-            x = tf.concat([ccc, aa], axis = -1)
-            xx = tf.sigmoid(tf.matmul(x,  tf.transpose(w_o, [1,0])+b_o), name='o_gate')
-            xx_title = tf.tanh(tf.matmul(x,  tf.transpose(w_q, [1,0])+b_q), name='q_gate')
-
-            xx =  xx*xx_title
-
-            ins = tf.concat([kkk, aa,sd,dd], axis = -1)
-            ooo = tf.sigmoid(tf.matmul(ins,  tf.transpose(w_1, [1,0])+b_1), name='1_gate')
-
-            kkk = ooo*kkk +    (1-ooo) * xx 
-
-            h_i = tf.expand_dims(kkk, axis = 1)
-            h.append(h_i)
-
-        output = tf.concat(h, axis = 1)
-        logits = tf.reduce_sum(target_data*output, axis = -1, name="logits")
-        logits = tf.reshape(logits, [-1])
-        selected_logits = tf.gather(logits, self.target_index)
-        
-        #make prediction
-        self.pred = tf.sigmoid(selected_logits, name="pred")
-
-        # loss function
-        losses = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=selected_logits, labels=self.target_correctness), name="losses")
-
-        l2_losses = tf.add_n([tf.nn.l2_loss(tf.cast(v, tf.float32)) for v in tf.compat.v1.trainable_variables()],
-                                 name="l2_losses") * 0.000001
-        self.loss = tf.add(losses, l2_losses, name="loss")
-        
-        self.cost = self.loss
+    def compute_loss(self, batch):
+        pred, logits = self.forward(batch)
+        labels = batch["target_correctness"]
+        bce = F.binary_cross_entropy_with_logits(logits, labels)
+        l2 = sum(param.pow(2).sum() for param in self.parameters()) * 1e-6
+        return bce + l2, pred
