@@ -46,18 +46,20 @@ def _normalize_columns(raw_cols: Iterable[str]) -> Dict[str, Optional[str]]:
     return mapping
 
 
-def _coerce_scalar(val):
-    if isinstance(val, (list, tuple, np.ndarray)):
-        arr = np.array(val).ravel()
-        if arr.size == 0:
-            return np.nan
-        return arr[0]
-    return val
+def _coerce_sequence(val) -> list:
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    return [val]
 
 
-def _load_series(data: np.lib.npyio.NpzFile, name: str) -> pd.Series:
-    values = np.array(data[name]).flatten()
-    return pd.Series(values).apply(_coerce_scalar)
+def _load_object_array(data: np.lib.npyio.NpzFile, name: str) -> list:
+    values = np.array(data[name], dtype=object)
+    # The stored arrays are typically shaped (num_users,) with each element a
+    # per-user interaction sequence. Preserve that structure so we can expand
+    # it later instead of truncating to the first entry.
+    return [_coerce_sequence(v) for v in values]
 
 
 def _synthesize_timestamps(
@@ -107,24 +109,72 @@ def convert(input_path: str, output_csv: str) -> None:
     data = np.load(input_path, allow_pickle=True)
     mapping = _normalize_columns(data.files)
 
-    df_dict = {}
-    for canon, raw in mapping.items():
-        if raw is None:
-            continue
-        df_dict[canon] = np.array(data[raw]).flatten()
-    df = pd.DataFrame(df_dict)
+    # Expand per-user sequences into per-interaction rows
+    user_ids = np.array(data[mapping["user_id"]], dtype=object).tolist()
+    problem_seqs = _load_object_array(data, mapping["problem_id"])
+    correct_seqs = _load_object_array(data, mapping["correct"])
+    skill_seqs = _load_object_array(data, mapping["skill_id"])
 
-    for col in df.columns:
-        df[col] = df[col].apply(_coerce_scalar)
+    end_time_seqs = None
+    if mapping.get("end_time") is not None:
+        end_time_seqs = _load_object_array(data, mapping["end_time"])
+
+    first_rt_seqs = resp_time_seqs = None
+    if "first_response_time" in data.files and "response_time" in data.files:
+        first_rt_seqs = _load_object_array(data, "first_response_time")
+        resp_time_seqs = _load_object_array(data, "response_time")
+
+    rows = []
+    durations = []
+
+    for idx, uid in enumerate(user_ids):
+        problems = problem_seqs[idx]
+        corrects = correct_seqs[idx]
+        skills = skill_seqs[idx]
+
+        length = len(problems)
+        if not (len(corrects) == len(skills) == length):
+            raise ValueError(
+                f"Mismatched sequence lengths for user {uid}: "
+                f"problems={len(problems)}, correct={len(corrects)}, skills={len(skills)}"
+            )
+
+        end_times = end_time_seqs[idx] if end_time_seqs is not None else [np.nan] * length
+
+        duration_seq = None
+        if first_rt_seqs is not None and resp_time_seqs is not None:
+            frt = first_rt_seqs[idx]
+            rt = resp_time_seqs[idx]
+            if len(frt) != length or len(rt) != length:
+                raise ValueError(
+                    f"Mismatched response time lengths for user {uid}: "
+                    f"first_response_time={len(frt)}, response_time={len(rt)}, expected={length}"
+                )
+            duration_seq = pd.Series(frt, dtype="float64").add(
+                pd.Series(rt, dtype="float64"), fill_value=0
+            )
+
+        for j in range(length):
+            rows.append(
+                {
+                    "user_id": uid,
+                    "problem_id": problems[j],
+                    "correct": corrects[j],
+                    "skill_id": skills[j],
+                    "end_time": end_times[j],
+                }
+            )
+
+            if duration_seq is not None:
+                durations.append(duration_seq.iloc[j])
+            else:
+                durations.append(np.nan)
+
+    df = pd.DataFrame(rows)
 
     # Prefer summing first_response_time + response_time when both exist.
-    duration_sum = None
-    if "first_response_time" in data.files and "response_time" in data.files:
-        first_rt = _load_series(data, "first_response_time")
-        resp_time = _load_series(data, "response_time")
-        duration_sum = pd.to_numeric(first_rt, errors="coerce").add(
-            pd.to_numeric(resp_time, errors="coerce"), fill_value=0
-        )
+    duration_series = pd.Series(durations, dtype=float)
+    duration_sum = duration_series if duration_series.notna().any() else None
 
     # Build timestamps
     df["end_time"] = _synthesize_timestamps(

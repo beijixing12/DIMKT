@@ -16,7 +16,7 @@ scripts.
 import argparse
 import os
 import time
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -106,35 +106,84 @@ def _read_npz(path: str) -> pd.DataFrame:
             "to include these arrays before running this script. Available arrays: "
             f"{available}. Original error: {e}"
         ) from e
-    df_dict = {}
-    for canon, raw in col_map.items():
-        if raw is None:
-            continue
-        values = data[raw]
-        df_dict[canon] = np.array(values).flatten()
-    df = pd.DataFrame(df_dict)
 
-    # If no timestamp-like column existed, synthesize a deterministic ordering
-    # so downstream slicing can still sort user interactions.
-    if "end_time" not in df.columns:
-        df["end_time"] = np.arange(len(df))
+    def _coerce_sequence(val) -> list:
+        if isinstance(val, np.ndarray):
+            return val.tolist()
+        if isinstance(val, (list, tuple)):
+            return list(val)
+        return [val]
 
-    # Normalize any array-like cells to scalars so downstream set()/dict
-    # operations work as expected.
-    def _coerce_scalar(val):
-        if isinstance(val, (list, tuple, np.ndarray)):
-            arr = np.array(val).ravel()
-            if arr.size == 0:
-                return np.nan
-            return arr[0]
-        return val
+    def _load_object_array(name: str) -> list:
+        values = np.array(data[name], dtype=object)
+        return [_coerce_sequence(v) for v in values]
 
-    for col in df.columns:
-        df[col] = df[col].apply(_coerce_scalar)
+    user_ids = np.array(data[col_map["user_id"]], dtype=object).flatten().tolist()
+    problem_seqs = _load_object_array(col_map["problem_id"])
+    correct_seqs = _load_object_array(col_map["correct"])
+    skill_seqs = _load_object_array(col_map["skill_id"])
 
-    # Ensure correctness values are numeric
-    if "correct" in df.columns:
-        df["correct"] = pd.to_numeric(df["correct"], errors="coerce")
+    end_time_seqs = None
+    if col_map.get("end_time") is not None:
+        end_time_seqs = _load_object_array(col_map["end_time"])
+
+    first_rt_seqs = resp_time_seqs = None
+    if "first_response_time" in data.files and "response_time" in data.files:
+        first_rt_seqs = _load_object_array("first_response_time")
+        resp_time_seqs = _load_object_array("response_time")
+
+    rows = []
+    durations = []
+
+    for idx, uid in enumerate(user_ids):
+        problems = problem_seqs[idx]
+        corrects = correct_seqs[idx]
+        skills = skill_seqs[idx]
+
+        length = len(problems)
+        if not (len(corrects) == len(skills) == length):
+            raise ValueError(
+                f"Mismatched sequence lengths for user {uid}: "
+                f"problems={len(problems)}, correct={len(corrects)}, skills={len(skills)}"
+            )
+
+        end_times = end_time_seqs[idx] if end_time_seqs is not None else [np.nan] * length
+
+        duration_seq = None
+        if first_rt_seqs is not None and resp_time_seqs is not None:
+            frt = first_rt_seqs[idx]
+            rt = resp_time_seqs[idx]
+            if len(frt) != length or len(rt) != length:
+                raise ValueError(
+                    f"Mismatched response time lengths for user {uid}: "
+                    f"first_response_time={len(frt)}, response_time={len(rt)}, expected={length}"
+                )
+            duration_seq = pd.Series(frt, dtype="float64").add(
+                pd.Series(rt, dtype="float64"), fill_value=0
+            )
+
+        for j in range(length):
+            rows.append(
+                {
+                    "user_id": uid,
+                    "problem_id": problems[j],
+                    "correct": corrects[j],
+                    "skill_id": skills[j],
+                    "end_time": end_times[j],
+                }
+            )
+
+            if duration_seq is not None:
+                durations.append(duration_seq.iloc[j])
+            else:
+                durations.append(np.nan)
+
+    df = pd.DataFrame(rows)
+
+    duration_series = pd.Series(durations, dtype=float)
+    duration_sum: Optional[pd.Series] = duration_series if duration_series.notna().any() else None
+    df["end_time"] = _synthesize_timestamps(df, col_map.get("end_time"), duration_sum=duration_sum)
+    df = df[["user_id", "problem_id", "correct", "skill_id", "end_time"]]
     return df
 
 
@@ -145,6 +194,50 @@ def _read_input(path: str) -> pd.DataFrame:
     if ext == ".npz":
         return _read_npz(path)
     raise ValueError(f"Unsupported file extension '{ext}'. Use .csv or .npz")
+
+
+def _synthesize_timestamps(
+    df: pd.DataFrame,
+    time_col: Optional[str],
+    *,
+    duration_sum: Optional[pd.Series] = None,
+) -> pd.Series:
+    # Prefer the sum of first/response durations when both exist and contain data.
+    if duration_sum is not None:
+        series = pd.to_numeric(duration_sum, errors="coerce")
+        if not series.isna().all():
+            grouped = series.groupby(df["user_id"])
+
+            def _make_ts(group: pd.Series) -> pd.Series:
+                diffs = group.diff().fillna(0)
+                if (diffs < 0).any():
+                    return group.cumsum()
+                return group
+
+            adjusted = grouped.transform(_make_ts)
+            if not adjusted.isna().all():
+                return adjusted.fillna(0.0)
+
+    if time_col is None:
+        # simple deterministic ordering per user
+        return df.groupby("user_id").cumcount().astype(float)
+
+    series = pd.to_numeric(df[time_col], errors="coerce")
+    if series.isna().all():
+        # fallback to deterministic ordering
+        return df.groupby("user_id").cumcount().astype(float)
+
+    # If the column looks like a duration (non-strictly increasing), convert to cumulative per user
+    grouped = series.groupby(df["user_id"])
+
+    def _make_ts(group: pd.Series) -> pd.Series:
+        diffs = group.diff().fillna(0)
+        if (diffs < 0).any():
+            return group.cumsum()
+        return group
+
+    adjusted = grouped.transform(_make_ts)
+    return adjusted.fillna(0.0)
 
 
 def _ensure_timestamp(df: pd.DataFrame) -> pd.DataFrame:
